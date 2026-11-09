@@ -286,9 +286,18 @@ class FilmOpenPlugin(WAN2GPPlugin):
                 ids = render_assistant_messages(runtime.tokenizer, messages, tools, add_generation_prompt=True, thinking_enabled=False)
                 log('complete.input', messages=messages, tools=tools, format='native', inputTokens=len(ids), maxTokens=maximum)
                 stage = 'generate'
-                runtime.prime_context(ids, seed=0)
-                result = runtime.generate_segment(max_new_tokens=maximum, seed=0, do_sample=False, temperature=None,
-                                                  top_p=None, top_k=None, thinking_enabled=False)
+                # The engine is sized at priming from the model's minimum context: WanGP's loader leaves the prompt enhancer's 8000
+                # (qwen35_text.py:1472), and a longer prompt then has one token to answer. As Deepy does (shared/deepy/engine.py:7891),
+                # the hint is this prompt and its maximum answer; WanGP's value is put back after the answer.
+                was = getattr(model, '_prompt_enhancer_min_model_len_hint', None)
+                model._prompt_enhancer_min_model_len_hint = len(ids) + maximum
+                log('complete.context', inputTokens=len(ids), maxTokens=maximum, hint=len(ids) + maximum, was=was)
+                try:
+                    runtime.prime_context(ids, seed=0)
+                    result = runtime.generate_segment(max_new_tokens=maximum, seed=0, do_sample=False, temperature=None,
+                                                      top_p=None, top_k=None, thinking_enabled=False)
+                finally:
+                    model._prompt_enhancer_min_model_len_hint = was
                 log('complete.output', raw=result.raw_text, stop=result.stop_reason, outputTokens=result.token_count)
             finally:
                 if switch:
