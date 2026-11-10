@@ -23,6 +23,11 @@ def log(event, **values):
     print('[filmopen] ' + event + ' ' + json.dumps(values, default=str), flush=True)
 
 
+def _since(started):
+    """A `time.monotonic()` start as the local wall-clock time, for the log."""
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(time.time() - (time.monotonic() - started)))
+
+
 class FilmOpenPlugin(WAN2GPPlugin):
     def setup_ui(self):
         for name in ('WanGP_version', 'server_config', 'get_model_filename', 'get_model_def',
@@ -35,7 +40,9 @@ class FilmOpenPlugin(WAN2GPPlugin):
         # WanGP's server serves it at /filmopen: a POST with `model` and `max_tokens` at the top, as FilmOpen's policy binds them.
         self.register_web_app('/filmopen', self._web_app)
         self._jobs, self._session, self._download = {}, None, None
-        self._lock, self._llm = threading.Lock(), threading.Lock()
+        # One GPU job at a time (7-26w, answer 7): `_lock` decides both admissions, `_llm` is held for a completion's whole run,
+        # `_text` is its start while it is held — a value for the log.
+        self._lock, self._llm, self._text = threading.Lock(), threading.Lock(), None
         log('setup.done', helper=VERSION)
 
     def _info(self, payload):
@@ -49,7 +56,8 @@ class FilmOpenPlugin(WAN2GPPlugin):
         engine = self._engine()
         # wgp.py runs as __main__ and holds the loaded LLM in this global; a plug-in's copy of it is taken before it loads.
         loaded = getattr(sys.modules.get('__main__'), 'prompt_enhancer_llm_model', None) is not None
-        return dict(helper=VERSION, wangp=self.WanGP_version, gpu=gpus[0]['name'] if gpus else None,
+        # `admission`: one GPU job at a time (7-26w); the plug-in reads a helper without it as older, so it is updated.
+        return dict(helper=VERSION, admission='one-gpu-job', wangp=self.WanGP_version, gpu=gpus[0]['name'] if gpus else None,
                     vramBytes=gpus[0]['vramBytes'] if gpus else None, gpus=gpus, torch=torch.__version__,
                     cuda=torch.version.cuda, ramBytes=psutil.virtual_memory().total, profile=cfg.get('profile'),
                     quantizations=dict(transformer=cfg.get('transformer_quantization'), textEncoder=cfg.get('text_encoder_quantization')),
@@ -175,6 +183,9 @@ class FilmOpenPlugin(WAN2GPPlugin):
             def on_complete(self, result):
                 log('job.complete', job=client_id, success=result.success, cancelled=result.cancelled, files=result.generated_files, errors=[str(e) for e in result.errors], elapsedMs=int((time.monotonic() - entry['started']) * 1000))
         with self._lock:
+            if self._llm.locked():
+                log('gpu.busy', refused='render', holder='text', job=client_id, since=self._text, reason='a completion runs on the local LLM')
+                return {'busy': 'text', 'message': 'WanGP is answering a text request on its local model; render again when it finishes'}
             if self._session is None:
                 from shared.api import WanGPSession
                 service = self.state.value.service
@@ -183,7 +194,20 @@ class FilmOpenPlugin(WAN2GPPlugin):
                 self._session._gradio_webui_context = {'load_queue': service.load_inline_queue}
             entry['job'] = self._session.submit_task(settings, callbacks=Callbacks())
             self._jobs[client_id] = entry
+            log('generate.admitted', job=client_id, settings=settings, reason='no completion holds the GPU')
         return {'job': client_id}
+
+    def _render(self):
+        """The render that holds the GPU, as the log names it — the helper's own job submitted and not done, WanGP's
+        generation in progress or a task in WanGP's queue — or None."""
+        for job_id, entry in self._jobs.items():
+            if entry['kind'] == 'generate' and not entry['job'].done:
+                return dict(job=job_id, since=_since(entry['started']), reason="the helper's render is submitted and not done")
+        if self.is_generation_in_progress():
+            return dict(job=None, since=None, reason='WanGP renders')
+        if self.state.value.service._state['gen'].get('queue'):
+            return dict(job=None, since=None, reason="WanGP's queue holds a task")
+        return None
 
     def _job(self, payload):
         job_id = str(payload['job'])
@@ -239,11 +263,22 @@ class FilmOpenPlugin(WAN2GPPlugin):
             if wanted is None:
                 log('complete.engine', requested=requested, decision='unknown')
                 return answer(409, dict(error='unknown-engine', message=f'WanGP has no local LLM named {requested}'))
-            if self.is_generation_in_progress() or not self._llm.acquire(blocking=False):
-                log('complete.decided', decision='busy', reason='a render runs' if self.is_generation_in_progress() else 'another completion runs')
-                return answer(409, dict(error='busy', message='WanGP is busy rendering or answering; try again when it finishes'))
-            cfg = self.server_config
+            with self._lock:  # The render's admission reads `_llm` under this lock too: one decision for both.
+                holder = self._render()
+                if holder:
+                    holder['holder'] = 'render'
+                elif self._llm.acquire(blocking=False):
+                    self._text = _since(started)
+                else:
+                    holder = dict(holder='text', job=None, since=self._text, reason='another completion runs')
+            if holder:
+                log('gpu.busy', refused='text', **holder)
+                log('complete.decided', decision='busy', reason=holder['reason'])
+                doing = 'rendering' if holder['holder'] == 'render' else 'answering another text request'
+                return answer(409, dict(error='busy', message=f'WanGP is busy {doing}; try again when it finishes'))
+            cfg, ids, maximum, outcome = self.server_config, None, None, None
             try:
+                self._gpu_reset()
                 stage = 'input'
                 tools, maximum = body.get('tools') or None, int(body['max_tokens'])
                 messages = [self._message(m) for m in body['messages']]
@@ -299,11 +334,23 @@ class FilmOpenPlugin(WAN2GPPlugin):
                 finally:
                     model._prompt_enhancer_min_model_len_hint = was
                 log('complete.output', raw=result.raw_text, stop=result.stop_reason, outputTokens=result.token_count)
+                outcome = result.stop_reason
+            except Exception as error:
+                outcome = f'{type(error).__name__}: {error}'
+                raise
             finally:
-                if switch:
-                    self.reset_prompt_enhancer()  # WanGP's next own use loads its engine again.
-                    log('complete.engine.reset', engine=requested, reason="WanGP's next own use loads its own engine")
-                self._llm.release()
+                try:  # Whatever fails here, the call is measured and the GPU given back: renders wait only on a running completion.
+                    if switch:
+                        self.reset_prompt_enhancer()  # WanGP's next own use loads its engine again.
+                        log('complete.engine.reset', engine=requested, reason="WanGP's next own use loads its own engine")
+                except Exception as error:
+                    outcome = f'{outcome}; engine reset failed: {type(error).__name__}: {error}'
+                    raise
+                finally:
+                    try:
+                        self._measure(requested, ids, maximum, started, outcome)
+                    finally:
+                        self._llm.release()
             usage = dict(inputTokens=len(ids), outputTokens=result.token_count)
             # Plan 2, M4, before any decoding (review 1, M3): an answer stopped at its maximum is refused where tools were offered,
             # where it holds tool markup (offered or not) or where no words came; only words alone keep `length`.
@@ -324,6 +371,31 @@ class FilmOpenPlugin(WAN2GPPlugin):
         except Exception as error:
             log('complete.fail', stage=stage, error=repr(error), trace=traceback.format_exc())
             return answer(500, dict(error='failed', message=str(error) if stage == 'load' else f'{type(error).__name__}: {error}'))
+
+    @staticmethod
+    def _gpu_reset():
+        """Starts the peak VRAM counter at an admission, so a measure is this call's and not the process's lifetime peak."""
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    @staticmethod
+    def _measure(model, ids, maximum, started, outcome):
+        """Item 8 (7-26w): what one admitted completion took — peak VRAM since its admission, WanGP's RAM, the time and how it
+        ended; measured, never bounded. A WanGP that dies leaves no line: its terminal's last lines and dmesg stand in. A
+        measure that fails is logged and changes nothing: the answer, or the error that ended the call, stands."""
+        values = dict(model=model, inputTokens=None if ids is None else len(ids), maxTokens=maximum,
+                      ms=int((time.monotonic() - started) * 1000), outcome=outcome)
+        try:
+            import psutil
+            import torch
+            cuda = torch.cuda.is_available()
+            values.update(peakVram=torch.cuda.max_memory_allocated() if cuda else None,
+                          peakReserved=torch.cuda.max_memory_reserved() if cuda else None,
+                          ram=psutil.Process().memory_info().rss, ramUsed=psutil.virtual_memory().used)
+        except Exception as error:
+            values.update(measureError=f'{type(error).__name__}: {error}')
+        log('complete.measure', **values)
 
     @staticmethod
     def _message(message):
